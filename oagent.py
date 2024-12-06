@@ -20,17 +20,20 @@ import typer
 import pathspec
 import subprocess
 import functools
+import atexit
 
 # DEFAULT_MODEL = "qwq"
 DEFAULT_MODEL = "qwq-patched:latest"
 
 EXTRA_SYSTEM_PROMPT = f"""
 IMPORTANT:
+- Shell calls are tool calls, so must be wrapped in XML+JSON.
 - Tool calls are a complete XML tag around a JSON object.
+- Write "RESULT: CONCLUSIVE" if you found the answer. Otherwise, write "RESULT: INCONCLUSIVE".
+- CRUCIAL: ALWAYS conclude your answer with "RESULT: CONCLUSIVE" or "RESULT: INCONCLUSIVE" as your last message. If you don't do this, a child will die an unmerciful death.
+- DO NOT rely on your memory; use the shell tool to search files, install packages, etc.
 - Figure out what tools you need, emit the tool calls, and then exit as quick as possible.
-- NEVER include tool calls if you know what the answer is.
-- NEVER write code; use tools instead.
-- Current directory: {pathlib.Path.cwd()}
+- NEVER write markdown code blocks for shell; use tools instead.
 - Current time: {time.strftime("%Y-%m-%d %H:%M:%S")}
 """.strip()
 
@@ -46,7 +49,6 @@ class ToolCallResult(pydantic.BaseModel):
 _num_tool_calls = 0
 _TOOLS = []
 def tool(fn):
-    _TOOLS.append(fn)
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         global _num_tool_calls
@@ -60,6 +62,7 @@ def tool(fn):
             error_msg = f"ERROR: Tool {fn.__name__} failed with exception: {str(e)}"
             print(f"Tool error: {error_msg}")
             return error_msg
+    _TOOLS.append(wrapper)
     return wrapper
 
 
@@ -68,104 +71,78 @@ def expand_path(path: str) -> pathlib.Path:
     return pathlib.Path(path).expanduser().resolve()
 
 
-@tool
-def list_files(path: str = ".", glob: str = "**/*") -> list[str]:
-    """Recursively list the files in the given path, respecting .gitignore.
+class DockerContainer:
+    def __init__(self):
+        self.container_id = None
     
-    Parameters:
-        path: Directory to list files from, defaults to current directory
-        glob: Pattern to match files against, defaults to all files
+    def start(self):
+        """Start a long-running Alpine container."""
+        if self.container_id is None:
+            result = subprocess.run(
+                "docker run -d --rm --read-only -v {}:/workspace:ro --workdir /workspace alpine:latest tail -f /dev/null".format(pathlib.Path.cwd()),
+                shell=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to start container: {result.stdout}")
+            container_id = result.stdout.strip()
+            # Verify container is running
+            check = subprocess.run(
+                f"docker ps -q --filter id={container_id}",
+                shell=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            if check.returncode != 0 or not check.stdout.strip():
+                raise RuntimeError(f"Container failed to start properly")
+            self.container_id = container_id
     
-    Returns:
-        list[str]: List of file paths relative to the given directory
-    """
+    def stop(self):
+        """Stop the container if it's running."""
+        if self.container_id:
+            subprocess.run(f"docker stop {self.container_id}", shell=True)
+            self.container_id = None
 
-    root = expand_path(path)
-    
-    # Search for .gitignore up the directory tree
-    current = root
-    gitignore = None
-    while current != current.parent:
-        if (current / ".gitignore").exists():
-            gitignore = current / ".gitignore"
-            break
-        current = current.parent
-    
-    # Parse gitignore if found
-    if gitignore:
-        spec = pathspec.PathSpec.from_lines(
-            pathspec.patterns.GitWildMatchPattern,
-            gitignore.read_text().splitlines()
-        )
-    else:
-        spec = pathspec.PathSpec([])
 
-    # Get all files and filter out gitignored ones
-    files = [
-        str(f.relative_to(root))
-        for f in root.glob(glob)
-        if f.is_file() and not spec.match_file(str(f.relative_to(root)))
-    ]
-    
-    return files
+# Global container instance
+docker_container = DockerContainer()
 
 
 @tool
-def read_file(path: str) -> str:
-    """Read and return the contents of a file.
+def shell(command: str) -> str:
+    """Execute a shell command and return its output. The command executes in
+    a docker container with the current directory mounted as /workspace, as readonly.
+    Other than that, you can run any command whatsoever, including installing
+    packages, etc. It's alpine linux, so commands are in ash shell. The container
+    stays running for the duration of the entire chat session.
+
+    Current directory: /workspace
     
     Parameters:
-        path: Path to the file to read
+        command: The shell command to execute
     
     Returns:
-        str: Contents of the file or error message
-    """
-    try:
-        file_path = expand_path(path)
-        # Basic safety check - don't allow reading outside current directory
-        if not str(file_path).startswith(str(pathlib.Path.cwd())):
-            return f"Error: Cannot access files outside current directory: {path}"
-        if not file_path.is_file():
-            return f"Error: Not a file or file not found: {path}"
-        return file_path.read_text()
-    except Exception as e:
-        return f"Error reading file {path}: {str(e)}"
-
-
-@tool
-def ripgrep(pattern: str, path: str = ".", args: str = "") -> str:
-    """Search for a pattern in files using ripgrep (rg).
-    
-    Parameters:
-        pattern: The pattern to search for in files
-        path: Directory to search in, defaults to current directory
-        args: Additional ripgrep arguments (e.g. "-i" for case-insensitive)
-    
-    Returns:
-        str: The search results or error message
+        str: Combined stdout and stderr output
     """
     try:
-        cmd = ["rg", "--no-heading", "--line-number"]
-        if args:
-            cmd.extend(args.split())
-        cmd.extend([pattern, str(expand_path(path))])
+        # Ensure container is running
+        docker_container.start()
         
+        # Execute command in existing container
+        restricted_cmd = f"docker exec {docker_container.container_id} /bin/sh -c '{command}'"
         result = subprocess.run(
-            cmd,
-            capture_output=True,
+            restricted_cmd,
+            shell=True,
             text=True,
-            check=False  # Don't raise on non-zero exit (no matches)
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        
-        if result.returncode not in (0, 1):  # 0=matches found, 1=no matches
-            return f"Error running ripgrep: {result.stderr}"
-            
-        return result.stdout or "No matches found"
-        
-    except FileNotFoundError:
-        return "Error: ripgrep (rg) not found. Please install ripgrep."
+        output = result.stdout.strip()
+        return f"{output}\n[Exit {result.returncode}]" if output else f"[Exit {result.returncode}]"
     except Exception as e:
-        return f"Error running ripgrep: {str(e)}"
+        return f"Error executing command: {str(e)}"
 
 app = typer.Typer()
 
@@ -182,6 +159,7 @@ def print_and_buffer(output_buffer: list[str], *lines: str) -> None:
 def run(
     prompt: Annotated[str | None, typer.Argument(help="The prompt to send to the model. Defaults to stdin.")] = None,
     model: Annotated[str, typer.Option("--model", "-m", help="The primary model to use.")] = DEFAULT_MODEL,
+    no_vim: Annotated[bool, typer.Option("--no-vim", help="Do not open the output in vim.")] = False,
 ) -> None:
     """Run the model with the given prompt."""
     if prompt is None and sys.stdin.isatty():
@@ -191,10 +169,11 @@ def run(
     messages = [{"role": "user", "content": f"{EXTRA_SYSTEM_PROMPT}\n\n{prompt or sys.stdin.read()}"}]
     start = time.time()
     output_buffer = []
+    model_overrides = []
     
     while True:
         response = ollama.chat(
-            model=model,
+            model=(len(model_overrides) and model_overrides.pop() or model),
             messages=messages,
             stream=False,  # Not supported with tool use yet
             tools=_TOOLS,
@@ -243,7 +222,8 @@ def run(
     )
     
     # Show complete output in vim
-    open_in_vim("\n".join(output_buffer))
+    if not no_vim:
+        open_in_vim("\n".join(output_buffer))
 
 
 def open_in_vim(text: str) -> None:
@@ -261,5 +241,17 @@ def open_in_vim(text: str) -> None:
         os.unlink(tmp_path)  # Clean up temp file after vim closes
 
 
+# Register cleanup handler
+def cleanup():
+    docker_container.stop()
+
+atexit.register(cleanup)
+
+
 if __name__ == "__main__":
-    app()
+    # Start container before running app
+    docker_container.start()
+    try:
+        app()
+    finally:
+        docker_container.stop()
